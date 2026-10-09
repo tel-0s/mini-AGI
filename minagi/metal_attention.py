@@ -376,8 +376,11 @@ def why_unsupported():
     return _LIB.get("why")
 
 
-def _launch(fn, groups, bh, *args):
-    fn(*args, threads=(groups * THREADS, bh), group_size=(THREADS, 1))
+def _launch(kernel, groups, bh, *args):
+    """Run `kernel` over `groups` threadgroups for each of `bh` heads. One
+    function every launch goes through, so a profiler can time them
+    (tools/gpuprof.py wraps it)."""
+    getattr(_lib(), kernel)(*args, threads=(groups * THREADS, bh), group_size=(THREADS, 1))
 
 
 class _MetalAttention(torch.autograd.Function):
@@ -391,7 +394,7 @@ class _MetalAttention(torch.autograd.Function):
         scale = D ** -0.5
         o = torch.empty_like(q)
         lse = torch.empty(B, H, T, device=q.device, dtype=torch.float32)
-        _launch(getattr(_lib(), f"attn_fwd_{name}"), (T + BQ - 1) // BQ, B * H,
+        _launch(f"attn_fwd_{name}", (T + BQ - 1) // BQ, B * H,
                 q, k, v, o, lse, T, S, P, scale * math.log2(math.e))
         ctx.save_for_backward(q, k, v, o, lse)
         ctx.P = P
@@ -410,10 +413,9 @@ class _MetalAttention(torch.autograd.Function):
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        lib = _lib()
-        _launch(getattr(lib, f"attn_dq_{name}"), (T + BQ - 1) // BQ, B * H,
+        _launch(f"attn_dq_{name}", (T + BQ - 1) // BQ, B * H,
                 q, k, v, do, lse, delta, dq, T, S, ctx.P, c, scale)
-        _launch(getattr(lib, f"attn_dkv_{name}"), (S + BK - 1) // BK, B * H,
+        _launch(f"attn_dkv_{name}", (S + BK - 1) // BK, B * H,
                 q, k, v, do, lse, delta, dk, dv, T, S, ctx.P, c, scale)
         return dq, dk, dv, None
 
