@@ -15,6 +15,7 @@ left alone, because a model that reads a JPEG learns what a JPEG header looks
 like and nothing else useful.
 """
 
+import codecs
 import hashlib
 import json
 import os
@@ -42,9 +43,15 @@ def looks_like_text(path, probe=4096):
         return False
     if b"\x00" in head:
         return False
+    # incrementally, so a character the probe cut in half at its end is
+    # waited for rather than taken as invalid: a plain decode() refused every
+    # UTF-8 file whose 4,096th byte fell inside a character - Pride and
+    # Prejudice, for one, curly quotes and all
     try:
-        s = head.decode("utf-8")
+        s = codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
     except UnicodeDecodeError:
+        return False
+    if not s:
         return False
     printable = sum(1 for c in s if c.isprintable() or c in "\n\r\t")
     return printable / len(s) > 0.9
