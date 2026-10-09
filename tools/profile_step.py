@@ -36,6 +36,7 @@ sys.path.insert(0, ROOT)
 import torch                                                # noqa: E402
 
 from minagi import device as D                              # noqa: E402
+from minagi.optim import clip_grad_norm_                    # noqa: E402
 from minagi.precision import amp, set_compute_dtype        # noqa: E402
 
 
@@ -102,7 +103,7 @@ def main():
             if hasattr(model, "pool_balance"):
                 loss = loss + model.pool_balance()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
+            clip_grad_norm_(model.parameters(), a.clip)
             return loss
 
         for i in range(a.warmup):

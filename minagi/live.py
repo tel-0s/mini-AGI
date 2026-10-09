@@ -37,6 +37,7 @@ import time
 import torch
 
 from . import device as D
+from .optim import clip_grad_norm_
 from .precision import amp
 
 
@@ -148,7 +149,7 @@ class LiveLearner:
                 if hasattr(self.model, "pool_balance"):
                     loss = loss + self.model.pool_balance()
             loss.backward()
-            gn = float(torch.nn.utils.clip_grad_norm_(
+            gn = float(clip_grad_norm_(
                 self.model.parameters(), self.clip))
             self.opt.step()
         finally:

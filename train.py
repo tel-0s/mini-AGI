@@ -60,7 +60,7 @@ from minagi.recur import RecurConfig, RecurCoder, load_recur
 from minagi.pool import PooledMLP, AutoGrow
 from minagi.stream import StreamSet, Evaluator, detach_caches, ramp_context
 from minagi.plasticity import Plasticity
-from minagi.optim import GradSNR
+from minagi.optim import GradSNR, clip_grad_norm_
 from minagi import store as weights_store
 
 
@@ -269,7 +269,7 @@ def cmd_stream(args):
             (loss / args.accum).backward()
             detach_caches(streams.active.caches)
             seen += args.chunk
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        gn = clip_grad_norm_(model.parameters(), args.clip)
         opt.step()
 
         if step % args.log_every == 0:
@@ -1130,7 +1130,7 @@ def cmd_read(args):
                 if loss is None:
                     break
                 loss.backward()
-                grads.append(float(torch.nn.utils.clip_grad_norm_(
+                grads.append(float(clip_grad_norm_(
                     model.parameters(), args.clip)))
                 if step % 8 == 0:
                     # how much of the trunk gradient is signal. Reported only:

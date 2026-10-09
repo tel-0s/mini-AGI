@@ -45,6 +45,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from minagi.stream import FileReader, FolderEvaluator      # noqa: E402
 from minagi.ingest import collect, as_stream               # noqa: E402
+from minagi.optim import clip_grad_norm_                    # noqa: E402
 from minagi.pool import PooledMLP                          # noqa: E402
 from minagi.precision import set_compute_dtype             # noqa: E402
 import train as T                                          # noqa: E402
@@ -285,7 +286,7 @@ def main():
                 reader = fresh(lane_i[0])
                 continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
+            clip_grad_norm_(model.parameters(), a.clip)
             opt.step()
             # the window's forward admitted its experts; count them now
             touched.update(int(s) for s in getattr(pool, "slots", []) if s >= 0)
@@ -345,7 +346,7 @@ def main():
                         model, rdata[rl[ri]], rl[ri], a.chunk, ctx, device)
                     continue
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
+                clip_grad_norm_(model.parameters(), a.clip)
                 opt.step()
                 rdone += 1
             d = ev.run(a.eval_chunks)
