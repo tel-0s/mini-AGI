@@ -296,6 +296,27 @@ class SharedPool(nn.Module):
                 "want_k": float(self.want_k)}
 
 
+# FIXED SHAPES FOR MPS. Where characters halt at different depths, routing
+# runs on however many are still active - a different count nearly every
+# row - and PyTorch's MPS backend compiles a graph for each new shape of some
+# operations and never lets one go: a matmul (forward or backward) or a
+# softmax's backward, about 0.73 MB each. Over a reading session that was
+# host memory growing ~100 MB a minute, 9 GB to 14 GB on a 16 GB Mac in
+# twenty minutes. On MPS, then, the router's matmuls run over every
+# character of the window - a fixed shape - and keep the active rows after
+# (`full` in _route): the same numbers row for row, for ~67 MFLOP of rows
+# nobody reads. And the routing softmax that carries a gradient is written
+# out of exp, max, sum and divide - what F.softmax computes, by operations
+# that compile nothing per shape. Elsewhere both are as they always were.
+
+def _softmax(t):
+    """F.softmax(t, -1), and on MPS the same thing written out (see above)."""
+    if t.device.type != "mps":
+        return F.softmax(t, dim=-1)
+    e = torch.exp(t - t.detach().amax(-1, keepdim=True))
+    return e / e.sum(-1, keepdim=True)
+
+
 class PooledMLP(nn.Module):
     """Routes into the shared pool. Nothing here names a domain."""
 
@@ -359,7 +380,9 @@ class PooledMLP(nn.Module):
         m = active.reshape(-1)
         out = torch.zeros(B * T, D, device=x.device, dtype=x.dtype)
         if bool(m.any()):
-            out[m] = self._route(x.reshape(-1, D)[m].unsqueeze(0))[0]
+            flat = x.reshape(-1, D)
+            full = (flat, m) if x.device.type == "mps" else None
+            out[m] = self._route(flat[m].unsqueeze(0), full=full)[0]
         return out.view(B, T, D)
 
     @staticmethod
@@ -385,10 +408,18 @@ class PooledMLP(nn.Module):
             start += c
         return torch.cat(out).to(src.dtype)
 
-    def _route(self, x):
+    def _route(self, x, full=None):
         # see capture_routes() at the bottom of this file
         B, T, D = x.shape
         p = self.pool
+
+        def router(weight, detach=False):
+            """flat + depth_emb against `weight` - over the whole window and
+            then the active rows, where `full` gives them (see _softmax)."""
+            src, m = full if full is not None else (flat, None)
+            z = src + self.depth_emb
+            z = F.linear(z.detach() if detach else z, weight)
+            return z if m is None else z[m]
         # how many this token may choose between. For a resident pool that is
         # every expert; for a paged one it is the slots of the card, and the
         # indices are into the slots rather than the whole pool.
@@ -401,7 +432,7 @@ class PooledMLP(nn.Module):
         # p^(1/T), and the card is drawn the same way (PagedPool._draw).
         temp = float(getattr(p, "select_temperature", 0.0) or 0.0)
         if rows is None:
-            logits = self.router(flat + self.depth_emb)[:, :n].float()
+            logits = router(self.router.weight)[:, :n].float()
         else:
             if p.admitting():
                 # THE SELECTION RULE, while the forward has room on the card.
@@ -412,8 +443,7 @@ class PooledMLP(nn.Module):
                 # reachable, the routing below decides weights.
                 with torch.no_grad():
                     E = p.router_rows()
-                    z = F.linear(flat + self.depth_emb,
-                                 self.router.weight[:E]).float()
+                    z = router(self.router.weight[:E]).float()
 
                     def requested(scores):
                         q = F.softmax(scores, -1)
@@ -440,9 +470,8 @@ class PooledMLP(nn.Module):
                 if (float(getattr(p, "balance", 0.0) or 0.0) > 0
                         and self.training and torch.is_grad_enabled()
                         and p.balance_term() is None):
-                    zg = F.linear((flat + self.depth_emb).detach(),
-                                  self.router.weight[:E]).float()
-                    P = F.softmax(zg, -1).mean(0)
+                    zg = router(self.router.weight[:E], detach=True).float()
+                    P = _softmax(zg).mean(0)
                     p.note_balance(p.balance * (
                         E * (p.usage_share().to(P.device) * P).sum() - 1.0))
                 p.admit(mass, draw=self.top_k)
@@ -450,11 +479,11 @@ class PooledMLP(nn.Module):
             # only the rows belonging to the experts in VRAM, in slot order,
             # so column j of the logits is slot j and row rows[j] is its expert
             w = self.router.weight[rows]                      # [n, d_model]
-            logits = F.linear(flat + self.depth_emb, w).float()
+            logits = router(w).float()
             # a character whose request was not admitted takes its best
             # admitted expert: slots holding anything else are out of reach
             logits = logits.masked_fill(~p.admitted_mask(), float("-inf"))
-        probs = F.softmax(logits, dim=-1)
+        probs = _softmax(logits)
         k = min(self.top_k, n)
         if temp > 0:
             # drawn, not taken (Gumbel-top-k on the scores over T): weighted,
