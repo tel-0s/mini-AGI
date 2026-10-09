@@ -214,26 +214,30 @@ class GPUProfile:
         return checkpoint
 
     def _wrap_launch(self, real):
+        """A kernel module's _launch(kernel_name, ...): every Metal kernel
+        this project writes goes through one."""
         prof = self
 
-        def launch(name, groups, bh, *args):
-            tag = prof._op("metal", name, args)
+        def launch(name, *args):
+            tag = prof._op("metal", name, [a for a in args if isinstance(a, torch.Tensor)])
             prof._e.begin(tag)
             try:
-                return real(name, groups, bh, *args)
+                return real(name, *args)
             finally:
                 prof._e.end(tag)
         return launch
 
     def __enter__(self):
         import minagi.metal_attention as MA
+        import minagi.metal_experts as ME
         import minagi.model as MM
         import minagi.pool as MP
         torch.mps.synchronize()
         self._e.collect()                                  # nothing from before
-        self._patches = [(MA, "_launch", MA._launch), (MP, "checkpoint", MP.checkpoint),
-                         (MM, "checkpoint", MM.checkpoint)]
+        self._patches = [(MA, "_launch", MA._launch), (ME, "_launch", ME._launch),
+                         (MP, "checkpoint", MP.checkpoint), (MM, "checkpoint", MM.checkpoint)]
         MA._launch = self._wrap_launch(MA._launch)
+        ME._launch = self._wrap_launch(ME._launch)
         MP.checkpoint = self._wrap_checkpoint(MP.checkpoint)
         MM.checkpoint = self._wrap_checkpoint(MM.checkpoint)
         from torch.nn.modules import module as nnm

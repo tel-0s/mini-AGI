@@ -683,6 +683,24 @@ class PooledMLP(nn.Module):
                 out.index_add_(0, t_sorted, gathered * w_sorted.unsqueeze(-1))
                 return out.view(B, T, D)
 
+        # ON AN APPLE GPU, the whole of run_exact is five Metal kernels
+        # (metal_experts.py): no loop over experts, the weights cast once a
+        # step rather than once a row, and the backward recomputes what it
+        # needs inside its own kernel instead of re-running the forward under
+        # a checkpoint. Single-level pools computing in bf16; it checks itself
+        # once before it is trusted. MINAGI_METAL_EXPERTS=0 turns it off.
+        if (len(levels) == 1 and flat.device.type == "mps"
+                and dispatch_dtype(flat.device, flat.dtype) == torch.bfloat16
+                and hasattr(p, "inference_weights")
+                and os.environ.get("MINAGI_DISPATCH", "exact").strip().lower() != "padded"):
+            from minagi import metal_experts as ME
+            W1, W3, W2 = levels[0]
+            if ME.available(flat.device, W1.shape[2], W1.shape[1]):
+                gathered = ME.expert_swiglu(flat, t_sorted, runs, W1, W3, W2, p)
+                out = torch.zeros_like(flat)
+                out.index_add_(0, t_sorted, gathered * w_sorted.unsqueeze(-1))
+                return out.view(B, T, D)
+
         flat_w = tuple(t for lv_ in levels for t in lv_)
         fn = (run_exact if len(levels) == 1
               and os.environ.get("MINAGI_DISPATCH", "exact").strip().lower() != "padded"
