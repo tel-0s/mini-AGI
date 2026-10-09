@@ -46,6 +46,7 @@ if not any(v in os.environ for v in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_C
 import torch
 from flask import Flask, Response, jsonify, request
 
+from minagi import device as D
 from minagi.recur import load_any
 from minagi.tokenizer import ByteTokenizer
 
@@ -126,21 +127,22 @@ def _manifest(path):
 
 def load(weights, device=None, learn=True, lr=3e-4, save_every=8,
          chunk=None):
-    dev = torch.device(device) if device else torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(device or D.default())
     # read_only marks nothing dirty, so an expert paged in is never written
     # back. That is right for serving and wrong for learning - what the model
     # learned would live in VRAM until the slot was reused and then be gone.
     ro = not learn
     try:
         model, _ = load_any(weights, dev, read_only=ro)
-    except torch.cuda.OutOfMemoryError:
+    except Exception as e:                                 # noqa: BLE001
+        if not D.is_oom(e):
+            raise
         # training may be holding most of the card; serve slowly rather than
         # not at all
-        torch.cuda.empty_cache()
+        D.empty_cache(dev)
         dev = torch.device("cpu")
         model, _ = load_any(weights, dev, read_only=ro)
-        print("[warn] CUDA is full, serving on CPU", file=sys.stderr)
+        print("[warn] the GPU is full, serving on CPU", file=sys.stderr)
     model.eval()
     STATE.update(model=model, tok=ByteTokenizer(), weights=weights)
     print(f"[loaded] {weights} on {dev}", file=sys.stderr)
@@ -399,17 +401,18 @@ def api_chat():
                         reply.append(ev["t"])
                     yield f"data: {json.dumps(ev)}\n\n"
                 learned = remember(last_user, "".join(reply))
-        except torch.cuda.OutOfMemoryError:
-            # Almost always a training run holding the card. Say so and stay
-            # up: dying here closes the socket, and all the browser can tell
-            # you then is that the fetch failed.
-            torch.cuda.empty_cache()
-            yield "data: " + json.dumps({"error":
-                "the GPU is out of memory - something else is probably using "
-                "it. Restart with --device cpu, or stop the other process."
-                }) + "\n\n"
         except Exception as e:                            # noqa: BLE001
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            if D.is_oom(e):
+                # Almost always a training run holding the card. Say so and
+                # stay up: dying here closes the socket, and all the browser
+                # can tell you then is that the fetch failed.
+                D.empty_cache(D.default())
+                yield "data: " + json.dumps({"error":
+                    "the GPU is out of memory - something else is probably "
+                    "using it. Restart with --device cpu, or stop the other "
+                    "process."}) + "\n\n"
+            else:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
         dt = max(time.time() - t0, 1e-6)
         done = {"done": True, "n": n, "cps": round(n / dt, 1),
                 "learn": learn_state(), "pool": resident_experts()}
@@ -833,7 +836,7 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--device", default=None,
-                    help="cuda / cpu; default auto, falling back to CPU if "
+                    help="cuda / mps / cpu; default auto, falling back to CPU if "
                          "the card is full")
     ap.add_argument("--no-learn", dest="learn", action="store_false",
                     help="serve without learning. The weights are then opened "

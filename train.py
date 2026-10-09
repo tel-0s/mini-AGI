@@ -55,6 +55,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from minagi import device as D
 from minagi.recur import RecurConfig, RecurCoder, load_recur
 from minagi.pool import PooledMLP, AutoGrow
 from minagi.stream import StreamSet, Evaluator, detach_caches, ramp_context
@@ -182,7 +183,7 @@ def cmd_stream(args):
           "weight_decay": args.wd},
          {"params": [q for q in pool if q.dim() < 2], "name": "pool",
           "weight_decay": 0.0}],
-        lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
+        lr=args.lr, betas=(0.9, 0.95), fused=D.is_gpu(device))
     print(f"trunk learns at {args.trunk_lr_mult:g}x the pool's rate "
           f"({sum(q.numel() for q in trunk)/1e6:.2f}M trunk, "
           f"{sum(q.numel() for q in pool)/1e6:.2f}M pool)")
@@ -273,13 +274,12 @@ def cmd_stream(args):
 
         if step % args.log_every == 0:
             el = max(time.time() - t0, 1e-9)
-            vram = (f" vram {torch.cuda.max_memory_allocated()/1e6:.0f}MB"
-                    if device.type == "cuda" else "")
+            pk = D.peak(device)
+            vram = f" vram {pk/1e6:.0f}MB" if pk is not None else ""
             record("step", step=step, loss=float(loss), lr=lr,
                    grad_norm=float(gn), chars=seen, chars_per_s=seen / el,
                    context=streams.context, experts=model.pool.n_experts(),
-                   vram_mb=(torch.cuda.max_memory_allocated() / 1e6
-                            if device.type == "cuda" else None))
+                   vram_mb=pk / 1e6 if pk is not None else None)
             rp = (f" replay {streams.replays}" if args.replay > 0 else "")
             print(f"step {step:>6}/{args.steps} loss {float(loss):.4f} "
                   f"lr {lr:.2e} gn {float(gn):.2f} ctx {streams.context//1024}k "
@@ -769,7 +769,7 @@ def cmd_read(args):
     pg = {"params": pool_ps, "name": "pool", "weight_decay": args.wd,
           "lr": args.lr, "base_lr": args.lr}
     opt = torch.optim.AdamW([tg, pg], lr=args.lr, betas=(0.9, 0.95),
-                            fused=(device.type == "cuda"))
+                            fused=D.is_gpu(device))
     snr = GradSNR()
     print(f"  trunk learns at {args.trunk_lr_mult:g}x the pool's rate "
           f"({sum(q.numel() for q in trunk)/1e6:.1f}M trunk, "
@@ -1317,9 +1317,9 @@ def cmd_read(args):
                         print(f"    pool {pool.n_experts()} experts "
                               f"({'+%d' % rec['grew'] if rec['grew'] else ''}"
                               f"{'-%d' % gone if gone else ''})  "
-                              f"{pool.vram_params()/1e6:.1f}M in VRAM  "
-                              f"vram {torch.cuda.max_memory_allocated()/1e6:.0f}MB"
-                              if device.type == "cuda" else "", flush=True)
+                              f"{pool.vram_params()/1e6:.1f}M in VRAM"
+                              + (f"  vram {D.peak(device)/1e6:.0f}MB"
+                                 if D.is_gpu(device) else ""), flush=True)
                 if asked_stop or (args.minutes
                                   and (time.time() - t0) / 60 >= args.minutes):
                     break
@@ -1980,7 +1980,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="train mini-AGI: read files continually, or stream a "
                     "packed corpus. Batch 1, cached, chunked, either way")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default=D.default())
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     rd = sub.add_parser("read",

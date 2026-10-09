@@ -36,6 +36,7 @@ import time
 
 import torch
 
+from . import device as D
 from .precision import amp
 
 
@@ -75,7 +76,7 @@ class LiveLearner:
               "lr": lr * trunk_lr_mult, "base_lr": lr * trunk_lr_mult},
              {"params": pool_ps, "name": "pool", "weight_decay": wd,
               "lr": lr, "base_lr": lr}],
-            lr=lr, betas=(0.9, 0.95), fused=(dev.type == "cuda"))
+            lr=lr, betas=(0.9, 0.95), fused=D.is_gpu(dev))
         pool = getattr(model, "pool", None)
         if pool is not None and hasattr(pool, "attach_optimiser"):
             pool.attach_optimiser(self.opt)

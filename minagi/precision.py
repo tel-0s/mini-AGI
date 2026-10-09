@@ -46,6 +46,8 @@ import os
 
 import torch
 
+from minagi import device as D
+
 _COMPUTE = {"dtype": torch.float32}
 
 NAMES = {"fp32": torch.float32, "float32": torch.float32,
@@ -88,8 +90,7 @@ def cpu_bf16_native():
 
 
 def _device_type(device):
-    return "cuda" if device is None else (
-        device.type if hasattr(device, "type") else str(device).split(":")[0])
+    return D.kind(device)
 
 
 # -- GPUs without bf16 arithmetic -----------------------------------------
@@ -107,7 +108,10 @@ _GPU_INFO = {}
 
 
 def _gpu_info(device=None):
-    """(properties, is it AMD) for the GPU `device` names; None without one."""
+    """(properties, is it AMD) for the CUDA GPU `device` names; None without
+    one, and for Apple's GPU, which PyTorch has no properties for."""
+    if _device_type(device) != "cuda":
+        return None
     try:
         idx = getattr(device, "index", None)
         if idx is None:
@@ -171,7 +175,7 @@ def autocast_on(device=None):
     dev = _device_type(device)
     if dt is torch.float32:
         return False
-    if dev == "cuda":
+    if D.is_gpu(dev):
         return not gpu_fp32_instead(device)
     return dev == "cpu" and dt is torch.bfloat16 and cpu_bf16_native()
 
@@ -192,7 +196,7 @@ def describe(device=None):
         return name
     if dt is torch.float32:
         return "fp32"
-    if dev == "cuda":
+    if D.is_gpu(dev):
         return f"fp32 - {gpu} has no {name} arithmetic, and fp32 is faster on it"
     return f"fp32 - this CPU has no {name} arithmetic"
 

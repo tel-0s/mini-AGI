@@ -45,6 +45,7 @@ sys.path.insert(0, ROOT)
 import torch                                                # noqa: E402
 import torch.nn.functional as F                             # noqa: E402
 
+from minagi import device as D                              # noqa: E402
 from minagi import model as M                               # noqa: E402  (sets the AOTriton default)
 from minagi.precision import amp, set_compute_dtype        # noqa: E402
 
@@ -52,8 +53,7 @@ DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}
 
 
 def sync(dev):
-    if dev.type == "cuda":
-        torch.cuda.synchronize(dev)
+    D.sync(dev)
 
 
 def timed(fn, dev, reps=5, warm=2):
@@ -72,15 +72,13 @@ def timed(fn, dev, reps=5, warm=2):
 
 def peak_of(fn, dev):
     """Peak memory fn() allocates beyond what was already there, in GB."""
-    if dev.type != "cuda":
+    if not D.is_gpu(dev):
         return None
     sync(dev)
-    torch.cuda.empty_cache()
-    base = torch.cuda.memory_allocated(dev)
-    torch.cuda.reset_peak_memory_stats(dev)
-    fn()
-    sync(dev)
-    return (torch.cuda.max_memory_allocated(dev) - base) / 1e9
+    D.empty_cache(dev)
+    with D.PeakTracker(dev) as pt:
+        fn()
+    return pt.peak / 1e9
 
 
 def fmt_gb(x):
@@ -99,6 +97,9 @@ def describe(dev):
         arch = getattr(p, "gcnArchName", "") or f"sm_{p.major}{p.minor}"
         free, total = torch.cuda.mem_get_info(dev)
         print(f"  {p.name}, {arch}, {total / 2**30:.1f} GiB ({free / 2**30:.1f} free)")
+    elif dev.type == "mps":
+        print(f"  {D.name(dev)}, unified memory: {D.total(dev) / 2**30:.1f} GiB "
+              f"of it for this process")
     else:
         from minagi.precision import cpu_bf16_native
         print(f"  CPU, {torch.get_num_threads()} threads, "
@@ -184,11 +185,12 @@ def attention(dev, window, dtypes):
                     t = timed(lambda: run(path), dev, reps=3, warm=1)
                     mem = peak_of(lambda: run(path), dev)
                     res = f"{t * 1e3:7.1f}ms {fmt_gb(mem):>10}"
-                except torch.cuda.OutOfMemoryError:
-                    res = f"{'out of memory':>20}"
-                    torch.cuda.empty_cache()
                 except Exception as e:                      # noqa: BLE001
-                    res = f"  failed: {type(e).__name__}"
+                    if D.is_oom(e):
+                        res = f"{'out of memory':>20}"
+                        D.empty_cache(dev)
+                    else:
+                        res = f"  failed: {type(e).__name__}"
                 lead = (f"  {name:6} {case:14} {kern:18} {'yes' if fused else 'no':7}"
                         if first else f"  {'':6} {'':14} {'':18} {'':7}")
                 print(f"{lead} {path:8} {res}", flush=True)
@@ -291,7 +293,7 @@ def reading(dev, window, chunk, precisions, steps, profile):
             # measured as named: on a GPU where a run would compute in fp32
             # instead, bf16 is forced, so the two can be compared
             forced = os.environ.get("MINAGI_GPU_BF16")
-            if dev.type == "cuda" and name == "bf16":
+            if D.is_gpu(dev) and name == "bf16":
                 os.environ["MINAGI_GPU_BF16"] = "1"
             model, cfg, pool, _ = T.build_paged(wdir, dev, ram_capacity=40)
             # the depth policy reading runs under, from config.yaml, as train.py sets it
@@ -316,14 +318,21 @@ def reading(dev, window, chunk, precisions, steps, profile):
                 step(0)                              # loads the experts, warms the kernels
                 sync(dev)
                 if dev.type == "cuda":
-                    torch.cuda.reset_peak_memory_stats(dev)
+                    D.reset_peak(dev)
                 t0, depth = time.perf_counter(), []
                 for i in range(steps):
                     depth.append(step(i + 1))
                 sync(dev)
                 dt_ = (time.perf_counter() - t0) / steps
-                mem = (torch.cuda.max_memory_allocated(dev) / 1e9
-                       if dev.type == "cuda" else None)
+                if dev.type == "mps":
+                    # no peak counter: one more step, untimed, measured op
+                    # by op (see device.PeakTracker); peak of live tensors,
+                    # as CUDA counts it, so the two read alike
+                    with D.PeakTracker(dev) as pt:
+                        step(steps + 1)
+                    mem = pt.high / 1e9
+                else:
+                    mem = D.peak(dev) / 1e9 if D.is_gpu(dev) else None
                 from minagi.precision import autocast_on
                 print(f"  {name:5} {chunk / dt_:8.1f} char/s   {dt_:6.2f} s a step   "
                       f"peak {fmt_gb(mem)}   mean depth {sum(depth) / len(depth):.1f} rows"
@@ -346,15 +355,16 @@ def reading(dev, window, chunk, precisions, steps, profile):
                     print(f"\n  where one {name} step's time goes, by op:\n")
                     print("\n".join("    " + ln for ln in table.splitlines()))
                     print()
-            except torch.cuda.OutOfMemoryError:
+            except Exception as e:                  # noqa: BLE001
+                if not D.is_oom(e):
+                    raise
                 print(f"  {name:5} out of memory")
             del model, pool
             if forced is None:
                 os.environ.pop("MINAGI_GPU_BF16", None)
             else:
                 os.environ["MINAGI_GPU_BF16"] = forced
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
+            D.empty_cache(dev)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()
@@ -362,7 +372,7 @@ def reading(dev, window, chunk, precisions, steps, profile):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default=D.default())
     ap.add_argument("--window", type=int, default=4096,
                     help="characters a reading step forwards (model.context_end)")
     ap.add_argument("--chunk", type=int, default=2048,
@@ -383,7 +393,7 @@ def main():
                              f"something else is using it. Run this on a free card "
                              f"(or --force).")
     describe(dev)
-    names = ["bf16", "fp32", "fp16"] if dev.type == "cuda" else ["bf16", "fp32"]
+    names = ["bf16", "fp32", "fp16"] if D.is_gpu(dev) else ["bf16", "fp32"]
     attention(dev, a.window, [n for n in names if n != "fp16"])
     matmuls(dev, a.window, names)
     ops(dev, a.window, [n for n in names if n != "fp16"])

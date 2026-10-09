@@ -129,6 +129,16 @@ def fused_attention_available(device, dtype, masked=False):
     if mode == "fused":
         return True
     key = (device.type, device.index, dtype, masked)
+    if key not in _FUSED and device.type == "mps":
+        # PyTorch's MPS kernel computes the right attention - it passes the
+        # probe - but it is not a flash kernel: like the math path it builds
+        # the whole score matrix and keeps it for the backward. On an Apple
+        # M5 (16 GB), one reading step at a 4,096-character window peaked
+        # at 14 GB with it and swapped, 56 char/s; in blocks, 6.6 GB and
+        # 536 char/s.
+        _FUSED[key] = False
+        print(f"  attention: the {str(dtype).replace('torch.', '')} kernel on {device} "
+              f"keeps every score matrix - computing it in blocks", flush=True)
     if key not in _FUSED:
         _FUSED[key] = _probe_fused(device, dtype, masked)
         if not _FUSED[key]:

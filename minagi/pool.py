@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from . import device as D
 from .precision import dispatch_dtype
 
 class Expert(nn.Module):
@@ -703,12 +704,13 @@ def _mem_frac():
     Deliberately NOT mem_get_info(): that reports the caching allocator's
     reserved pool, which stays near 100% once the run is warm whether or not
     there is real room, so a brake reading it would refuse growth forever.
-    Peak *allocated* is the honest number - it is what has to fit.
+    Peak *allocated* is the honest number - it is what has to fit. MPS has
+    no such counter; what Metal holds is the nearest it has (see device.py).
     """
-    if not torch.cuda.is_available():
+    dev = D.default()
+    if dev == "cpu":
         return 0.0
-    total = torch.cuda.get_device_properties(0).total_memory
-    return torch.cuda.max_memory_allocated() / max(total, 1)
+    return D.peak(dev) / max(D.total(dev), 1)
 
 
 class AutoGrow:

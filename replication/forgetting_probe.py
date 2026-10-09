@@ -160,7 +160,8 @@ def main():
 
     marks = sorted({int(x) for x in a.at.split(",") if x.strip()})
     a.steps = max(a.steps, max(marks))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from minagi.device import default as default_device
+    device = torch.device(default_device())
     set_compute_dtype(a.precision)
 
     if a.read_root and a.read_root not in READ_ROOTS:
