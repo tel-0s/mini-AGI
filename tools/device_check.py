@@ -155,6 +155,7 @@ def attention(dev, window, dtypes):
             S = window
             masked = T != S
             fused = M.fused_attention_available(dev, dt, masked=masked)
+            metal = not fused and M.metal_attention_available(dev, dt)
             kern = backends(dev, dt, T, S)
             q = torch.randn(1, 8, T, 64, device=dev, dtype=dt, requires_grad=True)
             k = torch.randn(1, 8, S, 64, device=dev, dtype=dt, requires_grad=True)
@@ -169,6 +170,9 @@ def attention(dev, window, dtypes):
                             q, k, v, attn_mask=causal_lower_right(T, S))
                     else:
                         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                elif path == "metal":
+                    from minagi.metal_attention import metal_attention
+                    y = metal_attention(q, k, v, S - T)
                 elif path == "blocked":
                     y = M.blocked_attention(q, k, v, S - T)
                 else:
@@ -180,7 +184,8 @@ def attention(dev, window, dtypes):
                 q.grad = k.grad = v.grad = None
 
             first = True
-            for path in (["fused"] if fused else []) + ["blocked", "math"]:
+            for path in (["fused"] if fused else []) + (["metal"] if metal else []) \
+                    + ["blocked", "math"]:
                 try:
                     t = timed(lambda: run(path), dev, reps=3, warm=1)
                     mem = peak_of(lambda: run(path), dev)
@@ -195,8 +200,9 @@ def attention(dev, window, dtypes):
                         if first else f"  {'':6} {'':14} {'':18} {'':7}")
                 print(f"{lead} {path:8} {res}", flush=True)
                 first = False
-    print("  the model uses the fused path where 'fused?' says yes, the blocked one where it "
-          "says no;\n  math is what PyTorch falls back to on its own, shown for comparison")
+    print("  the model uses the fused path where 'fused?' says yes; where it says no, the Metal\n"
+          "  kernel on an Apple GPU that has it, and the blocked one elsewhere; math is what\n"
+          "  PyTorch falls back to on its own, shown for comparison")
     print()
 
 

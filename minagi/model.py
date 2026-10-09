@@ -135,10 +135,13 @@ def fused_attention_available(device, dtype, masked=False):
         # the whole score matrix and keeps it for the backward. On an Apple
         # M5 (16 GB), one reading step at a 4,096-character window peaked
         # at 14 GB with it and swapped, 56 char/s; in blocks, 6.6 GB and
-        # 536 char/s.
+        # 536 char/s. What runs instead is metal_attention where it passes
+        # its own probe, and blocks where it does not (_unfused_attention).
         _FUSED[key] = False
-        print(f"  attention: the {str(dtype).replace('torch.', '')} kernel on {device} "
-              f"keeps every score matrix - computing it in blocks", flush=True)
+        instead = ("the Metal kernel" if metal_attention_available(device, dtype)
+                   else "computing it in blocks")
+        print(f"  attention: PyTorch's {str(dtype).replace('torch.', '')} kernel on "
+              f"{device} keeps every score matrix - {instead}", flush=True)
     if key not in _FUSED:
         _FUSED[key] = _probe_fused(device, dtype, masked)
         if not _FUSED[key]:
@@ -149,14 +152,18 @@ def fused_attention_available(device, dtype, masked=False):
     return _FUSED[key]
 
 
-def _probe_fused(device, dtype, masked, sdpa=None):
+def _probe_fused(device, dtype, masked, sdpa=None, restrict=True):
     """
     The fused kernels alone on a small causal problem, forward and backward,
     against the blocked path in fp32. A missing kernel raises; one that is
     present and wrong - the mask aligned to the wrong corner, a broken
     backward - disagrees by far more than rounding does (under 1% in bf16).
+    `sdpa` checks another kernel with the same signature instead; `restrict`
+    False drops the limit to PyTorch's fused backends, which means nothing
+    to a kernel that is not one of them.
     """
     import warnings
+    from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
     sdpa = sdpa or F.scaled_dot_product_attention
     P, T = (96, 160) if masked else (0, 256)
@@ -170,7 +177,8 @@ def _probe_fused(device, dtype, masked, sdpa=None):
             q, k, v, w = (torch.randn(1, 2, n, 64, generator=g).to(device=device, dtype=dtype)
                           for n in (T, P + T, P + T, T))
             x = [t.requires_grad_() for t in (q, k, v)]
-            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+            with (sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+                  if restrict else nullcontext()):
                 if masked:
                     y = sdpa(*x, attn_mask=causal_lower_right(T, P + T))
                 else:
@@ -312,6 +320,49 @@ def blocked_attention(q, k, v, P, block=512):
     return _BlockedAttention.apply(q, k, v, P, block)
 
 
+_METAL = {}
+
+
+def metal_attention_available(device, dtype, head_dim=64):
+    """
+    Whether the Metal flash-attention kernel (metal_attention.py) computes
+    this model's attention on `device` in `dtype`: it exists here, and it
+    passed the same check a fused PyTorch kernel must pass, both cases, once
+    each. MINAGI_ATTENTION=blocked turns it off with everything else fused.
+    """
+    if device.type != "mps":
+        return False
+    if os.environ.get("MINAGI_ATTENTION", "auto").strip().lower() == "blocked":
+        return False
+    from minagi import metal_attention as MA
+    key = (device.type, device.index, dtype, head_dim)
+    if key not in _METAL:
+        ok = MA.supported(device, dtype, head_dim)
+        if ok:
+            def sdpa(q, k, v, attn_mask=None, is_causal=False):
+                return MA.metal_attention(q, k, v, k.shape[2] - q.shape[2])
+            ok = all(_probe_fused(device, dtype, masked, sdpa=sdpa, restrict=False)
+                     for masked in (False, True))
+            if not ok:
+                print(f"  attention: the Metal kernel failed its check for "
+                      f"{str(dtype).replace('torch.', '')} on {device} - computing "
+                      f"it in blocks", flush=True)
+        elif MA.why_unsupported():
+            print(f"  attention: no Metal kernel here ({MA.why_unsupported()}) - "
+                  f"computing it in blocks", flush=True)
+        _METAL[key] = ok
+    return _METAL[key]
+
+
+def _unfused_attention(q, k, v, P):
+    """Attention where PyTorch has no fused kernel that serves: the Metal
+    kernel on Apple GPUs, blocks everywhere else."""
+    if metal_attention_available(q.device, q.dtype, q.shape[-1]):
+        from minagi.metal_attention import metal_attention
+        return metal_attention(q, k, v, P)
+    return blocked_attention(q, k, v, P)
+
+
 class Attention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -371,12 +422,12 @@ class Attention(nn.Module):
             if fused_attention_available(q.device, q.dtype):
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             else:
-                y = blocked_attention(q, k, v, 0)
+                y = _unfused_attention(q, k, v, 0)
         elif fused_attention_available(q.device, q.dtype, masked=True):
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=causal_lower_right(T, kv_len))
         else:
-            y = blocked_attention(q, k, v, kv_len - T)
+            y = _unfused_attention(q, k, v, kv_len - T)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(y)
 
