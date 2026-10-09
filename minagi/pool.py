@@ -561,7 +561,10 @@ class PooledMLP(nn.Module):
                 out.index_add_(0, t_sorted, gathered * w_sorted.unsqueeze(-1))
                 return out.view(B, T, D)
 
-        counts = torch.bincount(e_sorted, minlength=n)
+        # how many assignments each slot took: `hit` above already counted
+        # them, one-hot and summed, before any were dropped - which is what
+        # bincount(e_sorted) counts. bincount itself took 3 ms a row on MPS.
+        counts = hit.round().long()
         counts_l = counts.tolist() if n else []      # the one read-back: cap, and runs
         cap = max(counts_l) if counts_l else 0
         if cap == 0:
