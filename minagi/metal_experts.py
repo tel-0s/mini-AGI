@@ -266,14 +266,16 @@ kernel void moe_dx(device const bfloat* dA1 [[buffer(0)]],    // [M, F]
   }
 }
 
-// C[e] = A_e^T B_e for every slot e: A [M, Ma] and B [M, Nb] hold every
-// assignment, by expert; groups[e] = (e, first row, end, -). A slot nothing
-// was routed to gets zeros.
+// C[e] = A_e^T B_e for every slot e - or, with `acc`, C[e] += A_e^T B_e:
+// A [M, Ma] and B [M, Nb] hold every assignment, by expert; groups[e] =
+// (e, first row, end, -). A slot nothing was routed to gets zeros, or is
+// left as it is.
 kernel void moe_dw(device const bfloat* A [[buffer(0)]],
                    device const bfloat* B [[buffer(1)]],
                    device float* C [[buffer(2)]],           // [E, Ma, Nb]
                    device const int4* groups [[buffer(3)]],
                    constant int& Ma [[buffer(4)]], constant int& Nb [[buffer(5)]],
+                   constant int& acc [[buffer(6)]],
                    uint3 tg [[threadgroup_position_in_grid]],
                    ushort tid [[thread_index_in_threadgroup]]) {
   const int4 g = groups[tg.z];
@@ -281,8 +283,9 @@ kernel void moe_dw(device const bfloat* A [[buffer(0)]],
   const int m0 = int(tg.y) * TM, n0 = int(tg.x) * TN;
   device float* Ce = C + size_t(e) * Ma * Nb;
   if (r1 <= r0) {
-    for (int j = tid; j < TM * TN; j += 128)
-      Ce[size_t(m0 + j / TN) * Nb + n0 + j % TN] = 0.0f;
+    if (!acc)
+      for (int j = tid; j < TM * TN; j += 128)
+        Ce[size_t(m0 + j / TN) * Nb + n0 + j % TN] = 0.0f;
     return;
   }
   auto Ab = mat(A, Ma, r1).slice(m0, r0);       // transposed: M = Ma, K = this expert's rows
@@ -293,7 +296,8 @@ kernel void moe_dw(device const bfloat* A [[buffer(0)]],
   for (ushort i = 0; i < Cc.get_capacity(); ++i) {
     if (!Cc.is_valid_element(i)) continue;
     auto ix = Cc.get_multidimensional_index(i);
-    Ce[size_t(m0 + ix[1]) * Nb + n0 + ix[0]] = Cc[i];
+    const size_t o = size_t(m0 + ix[1]) * Nb + n0 + ix[0];
+    if (acc) Ce[o] += Cc[i]; else Ce[o] = Cc[i];
   }
 }
 '''
@@ -405,6 +409,62 @@ def _keep(*ts):
     _KEPT.extend(weakref.ref(t) for t in ts)
 
 
+# ONE WEIGHT GRADIENT A FORWARD, NOT ONE A ROW. The same slots' weights
+# serve every recurrent row, so autograd would sum a full-size fp32 gradient
+# per row into each weight stack - three [32, 2048, 512] adds a row, ~100 ms
+# of a learning step. Instead, a forward's expert calls form a group, the
+# kernels add each call's weight gradients into the group's one buffer in
+# place, and only the group's last backward hands the sum to autograd; the
+# others hand back nothing.
+#
+# A group is a forward's calls on one bf16 copy of the weights - the copy is
+# made again at the start of every forward that trains. Should one forward
+# span two copies, it is two groups, each handing back its own sum, which
+# autograd adds: still right. A call whose graph is dropped without a
+# backward stops counting when its ctx goes (_Member), so a group cannot be
+# left waiting for it.
+
+_GROUPS = {}
+
+
+class _Group:
+    def __init__(self, cast):
+        self.cast = cast        # keeps the bf16 copy, so its id is not reused
+        self.pending = 0
+        self.acc = None
+
+
+class _Member:
+    def __init__(self, key, group):
+        self.key, self.group, self.done = key, group, False
+        group.pending += 1
+
+    def leave(self):
+        """This call is finished with: True if it was the group's last."""
+        if self.done:
+            return False
+        self.done = True
+        g = self.group
+        g.pending -= 1
+        if g.pending > 0:
+            return False
+        if _GROUPS.get(self.key) is g:
+            del _GROUPS[self.key]
+        return True
+
+    def __del__(self):
+        if self.leave():
+            self.group.acc = None
+
+
+def _join(wb):
+    key = id(wb[0])
+    g = _GROUPS.get(key)
+    if g is None or g.cast is not wb[0]:
+        g = _GROUPS[key] = _Group(wb[0])
+    return _Member(key, g)
+
+
 class _ExpertSwiGLU(torch.autograd.Function):
 
     @staticmethod
@@ -429,6 +489,7 @@ class _ExpertSwiGLU(torch.autograd.Function):
         else:
             Y, k = torch.empty(M, D, device=flat.device, dtype=torch.bfloat16), "moe_down_bf16"
         _launch(k, (D // TN, nt), H, w2, Y, tiles, D, F)
+        ctx.member = _join(wb) if any(ctx.needs_input_grad[1:4]) else None
         ctx.kept = keep
         if keep:
             ctx.save_for_backward(flat, t_sorted, tiles, groups, X, A1, A3)
@@ -461,12 +522,22 @@ class _ExpertSwiGLU(torch.autograd.Function):
         dX = torch.empty(M, D, device=dev)
         _launch("moe_dx", (D // TN, nt), dA1, dA3, w1, w3, dX, tiles, D, F)
         dflat = torch.zeros_like(flat).index_add_(0, t_sorted, dX.to(flat.dtype))
-        dW1 = torch.empty(E, F, D, device=dev)
-        dW3 = torch.empty(E, F, D, device=dev)
-        dW2 = torch.empty(E, D, F, device=dev)
-        _launch("moe_dw", (D // TN, F // TM, E), dA1, X, dW1, groups, F, D)
-        _launch("moe_dw", (D // TN, F // TM, E), dA3, X, dW3, groups, F, D)
-        _launch("moe_dw", (F // TN, D // TM, E), dYb, H, dW2, groups, D, F)
+        m = ctx.member
+        if m is None:
+            return dflat, None, None, None, None, None, None, None
+        g = m.group
+        first = g.acc is None
+        if first:
+            g.acc = (torch.empty(E, F, D, device=dev), torch.empty(E, F, D, device=dev),
+                     torch.empty(E, D, F, device=dev))
+        dW1, dW3, dW2 = g.acc
+        acc = 0 if first else 1
+        _launch("moe_dw", (D // TN, F // TM, E), dA1, X, dW1, groups, F, D, acc)
+        _launch("moe_dw", (D // TN, F // TM, E), dA3, X, dW3, groups, F, D, acc)
+        _launch("moe_dw", (F // TN, D // TM, E), dYb, H, dW2, groups, D, F, acc)
+        if not m.leave():
+            return dflat, None, None, None, None, None, None, None
+        g.acc = None
         return dflat, dW1, dW3, dW2, None, None, None, None
 
 

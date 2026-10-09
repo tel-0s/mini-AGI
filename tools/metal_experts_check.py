@@ -128,6 +128,56 @@ def correctness(quick):
     return bad == 0
 
 
+def rows():
+    """Several rows on one set of weights, as the recurrence runs them: the
+    weight gradients must come back summed, whether by .backward() or by
+    autograd.grad, and a graph dropped without a backward must not leave
+    its rows waiting."""
+    N, E, D, Fd, k, R = 400, 32, 512, 2048, 8, 4
+    torch.manual_seed(1)
+    W = [torch.randn(E, Fd, D, device=DEV) * D ** -0.5, torch.randn(E, Fd, D, device=DEV) * D ** -0.5,
+         torch.randn(E, D, Fd, device=DEV) * Fd ** -0.5]
+    xs = [torch.randn(N, D, device=DEV) for _ in range(R)]
+    routes = [routing(N, E, k, 1.5, 10 + r) for r in range(R)]
+    gYs = [torch.randn(rt[0].numel(), D, device=DEV) for rt in routes]
+
+    def loss(fn, a, b, c):
+        return sum((fn(xs[r], rt[0], rt[1], a, b, c).float() * gYs[r]).sum()
+                   for r, rt in enumerate(routes))
+
+    exact = lambda x, t, ru, a, b, c: run_exact(x, a, b, c, t, ru, torch.float32)   # noqa: E731
+    ref = [w.clone().requires_grad_() for w in W]
+    loss(exact, *ref).backward()
+    print("ROWS  four rows on one set of weights, relative error against exact fp32")
+    ok = True
+    for how in ("backward", "autograd.grad"):
+        got = [w.clone().requires_grad_() for w in W]
+        pool = StubPool(*got)
+        kern = lambda x, t, ru, a, b, c: ME.expert_swiglu(x, t, ru, a, b, c, pool)   # noqa: E731
+        if how == "backward":
+            loss(kern, *got).backward()
+            gs = [w.grad for w in got]
+        else:
+            gs = torch.autograd.grad(loss(kern, *got), got)
+        errs = [rel(g, r.grad) for g, r in zip(gs, ref)]
+        good = all(e < 1e-2 for e in errs)
+        ok &= good
+        print(f"  {how:14} dW1 {errs[0]:.1e}  dW3 {errs[1]:.1e}  dW2 {errs[2]:.1e}"
+              + ("" if good else "   FAIL"))
+    got = [w.clone().requires_grad_() for w in W]
+    pool = StubPool(*got)
+    y = loss(lambda x, t, ru, a, b, c: ME.expert_swiglu(x, t, ru, a, b, c, pool), *got)
+    del y                                          # dropped: no backward
+    import gc
+    gc.collect()
+    left = len(ME._GROUPS)
+    ok &= left == 0
+    print(f"  a graph dropped without a backward leaves {left} groups waiting"
+          + ("" if left == 0 else "   FAIL"))
+    print()
+    return ok
+
+
 def timed(fn, reps=7, warm=2):
     for _ in range(warm):
         fn()
@@ -193,7 +243,7 @@ def main():
     a = ap.parse_args()
     if not ME.supported(DEV, 512, 2048):
         raise SystemExit(f"the Metal expert kernels are unavailable here: {ME.why_unsupported()}")
-    ok = correctness(a.quick)
+    ok = correctness(a.quick) and rows()
     if ok and not a.quick:
         speed()
     sys.exit(0 if ok else 1)
