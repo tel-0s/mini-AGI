@@ -376,7 +376,11 @@ def weights_bf16(pool):
 # kept stays inside a budget, and rows past it recompute: the first rows,
 # which have the most characters still active, are the ones kept. The
 # budget is a share of what the GPU may use - nothing on a small card, where
-# memory is the constraint this model was built around.
+# memory is the constraint this model was built around. On Apple Silicon the
+# GPU's budget is a share of the machine's one memory, which the pool's RAM
+# cache, the OS and every other program also live in: a 16 GB Mac reports
+# 11.8 GB, and keeping 2.4 GB of it took a reading session from 8 GB to 11
+# GB and into swap. There it takes 20 GB - a 24 GB Mac or larger.
 # MINAGI_EXPERT_SAVE_GB sets it outright; 0 turns keeping off.
 
 _KEPT = []                  # weak references to what forwards have kept
@@ -388,7 +392,8 @@ def _budget(device):
         return float(env) * 2 ** 30
     from minagi import device as D
     total = D.total(device) or 0
-    return 0.2 * total if total >= 10 * 2 ** 30 else 0.0
+    least = (20 if D.kind(device) == "mps" else 10) * 2 ** 30
+    return 0.2 * total if total >= least else 0.0
 
 
 def _may_keep(nbytes, device):
@@ -465,29 +470,44 @@ def _join(wb):
     return _Member(key, g)
 
 
+# ROUNDED BUFFERS. How many assignments a row computes changes from row to
+# row and step to step, and Metal's caching allocator keeps a buffer of
+# every size it has been asked for: with the pre-activations kept, what it
+# held grew by about a gigabyte a step, without bound, on a 16 GB Mac. So
+# every per-row buffer is the first M rows of one whose row count is rounded
+# up to a multiple of BUCKET - a few sizes, reused - at a cost of at most
+# BUCKET rows of padding, which no kernel reads.
+BUCKET = 2048
+
+
+def _rows(M, cols, dtype, device):
+    return torch.empty(-(-M // BUCKET) * BUCKET, cols, device=device, dtype=dtype)[:M]
+
+
 class _ExpertSwiGLU(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, flat, W1, W3, W2, t_sorted, tiles, groups, wb):
         w1, w3, w2, w2t = wb
         E, F, D = w1.shape
-        X = flat[t_sorted].to(torch.bfloat16).contiguous()
-        M, nt = X.shape[0], tiles.shape[0]
-        H = torch.empty(M, F, device=flat.device, dtype=torch.bfloat16)
+        M, nt, dev = t_sorted.shape[0], tiles.shape[0], flat.device
+        X = _rows(M, D, torch.bfloat16, dev)
+        X.copy_(flat[t_sorted])
+        H = _rows(M, F, torch.bfloat16, dev)
         # (a Function's forward always runs with grad mode off: whether this
         # call will be differentiated is what needs_input_grad says)
         keep = (any(ctx.needs_input_grad[:4])
                 and _may_keep(X.nbytes + 2 * H.nbytes, flat.device))
         if keep:
-            A1, A3 = torch.empty_like(H), torch.empty_like(H)
+            A1, A3 = _rows(M, F, torch.bfloat16, dev), _rows(M, F, torch.bfloat16, dev)
             _launch("moe_up_save", (F // TN, nt), X, w1, w3, H, A1, A3, tiles, D, F)
             _keep(X, A1, A3)
         else:
             _launch("moe_up", (F // TN, nt), X, w1, w3, H, tiles, D, F)
         if flat.dtype == torch.float32:
-            Y, k = torch.empty(M, D, device=flat.device), "moe_down_f32"
+            Y, k = _rows(M, D, torch.float32, dev), "moe_down_f32"
         else:
-            Y, k = torch.empty(M, D, device=flat.device, dtype=torch.bfloat16), "moe_down_bf16"
+            Y, k = _rows(M, D, torch.bfloat16, dev), "moe_down_bf16"
         _launch(k, (D // TN, nt), H, w2, Y, tiles, D, F)
         ctx.member = _join(wb) if any(ctx.needs_input_grad[1:4]) else None
         ctx.kept = keep
@@ -506,7 +526,7 @@ class _ExpertSwiGLU(torch.autograd.Function):
         if ctx.kept:
             flat, t_sorted, tiles, groups, X, dA1, dA3 = ctx.saved_tensors
             dev, M, nt = flat.device, X.shape[0], tiles.shape[0]
-            H = torch.empty(M, F, device=dev, dtype=torch.bfloat16)
+            H = _rows(M, F, torch.bfloat16, dev)
             _launch("moe_bwd_h_saved", (F // TN, nt), dYb, w2t, dA1, dA3, H, tiles, D, F)
             # A1 and A3 now hold dA1 and dA3: a second backward through this
             # graph must fail rather than read them as A1 and A3
@@ -515,11 +535,12 @@ class _ExpertSwiGLU(torch.autograd.Function):
         else:
             flat, t_sorted, tiles, groups = ctx.saved_tensors
             dev = flat.device
-            X = flat[t_sorted].to(torch.bfloat16).contiguous()
-            M, nt = X.shape[0], tiles.shape[0]
-            H, dA1, dA3 = (torch.empty(M, F, device=dev, dtype=torch.bfloat16) for _ in range(3))
+            M, nt = t_sorted.shape[0], tiles.shape[0]
+            X = _rows(M, D, torch.bfloat16, dev)
+            X.copy_(flat[t_sorted])
+            H, dA1, dA3 = (_rows(M, F, torch.bfloat16, dev) for _ in range(3))
             _launch("moe_bwd_h", (F // TN, nt), X, dYb, w1, w3, w2t, H, dA1, dA3, tiles, D, F)
-        dX = torch.empty(M, D, device=dev)
+        dX = _rows(M, D, torch.float32, dev)
         _launch("moe_dx", (D // TN, nt), dA1, dA3, w1, w3, dX, tiles, D, F)
         dflat = torch.zeros_like(flat).index_add_(0, t_sorted, dX.to(flat.dtype))
         m = ctx.member
