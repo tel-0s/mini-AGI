@@ -104,6 +104,41 @@ kernel void moe_up(device const bfloat* X [[buffer(0)]],    // [M, D] assignment
   }
 }
 
+// moe_up, keeping the pre-activations A1 = X W1^T and A3 = X W3^T for the
+// backward, which then needs one matmul instead of three (moe_bwd_h_saved)
+kernel void moe_up_save(device const bfloat* X [[buffer(0)]],
+                        device const bfloat* W1 [[buffer(1)]],
+                        device const bfloat* W3 [[buffer(2)]],
+                        device bfloat* H [[buffer(3)]],
+                        device bfloat* A1o [[buffer(4)]],          // [M, F]
+                        device bfloat* A3o [[buffer(5)]],          // [M, F]
+                        device const int4* tiles [[buffer(6)]],
+                        constant int& D [[buffer(7)]], constant int& F [[buffer(8)]],
+                        uint2 tg [[threadgroup_position_in_grid]]) {
+  const int4 t = tiles[tg.y];
+  const int e = t.x, r0 = t.y, r1 = t.z, f0 = int(tg.x) * TN;
+  auto Xb = mat(X, D, r1).slice(0, r0);
+  auto W1b = mat(W1 + size_t(e) * F * D, D, F).slice(0, f0);
+  auto W3b = mat(W3 + size_t(e) * F * D, D, F).slice(0, f0);
+  NT op;
+  auto A1 = op.get_destination_cooperative_tensor<decltype(Xb), decltype(W1b), float>();
+  auto A3 = op.get_destination_cooperative_tensor<decltype(Xb), decltype(W1b), float>();
+  op.run(Xb, W1b, A1);
+  op.run(Xb, W3b, A3);
+  for (ushort i = 0; i < A1.get_capacity(); ++i) {
+    if (!A1.is_valid_element(i)) continue;
+    auto ix = A1.get_multidimensional_index(i);
+    const int r = r0 + ix[1];
+    if (r < r1) {
+      const float a = A1[i], b = A3[i];
+      const size_t o = size_t(r) * F + f0 + ix[0];
+      H[o] = bfloat(a * sigm(a) * b);
+      A1o[o] = bfloat(a);
+      A3o[o] = bfloat(b);
+    }
+  }
+}
+
 #define MOE_DOWN(NAME, OT)                                                                    \
 kernel void NAME(device const bfloat* Hm [[buffer(0)]],    /* [M, F] */                       \
                  device const bfloat* W2 [[buffer(1)]],    /* [E, D, F] */                    \
@@ -165,6 +200,39 @@ kernel void moe_bwd_h(device const bfloat* X [[buffer(0)]],    // [M, D]
       H[o] = bfloat(si * b);
       dA1[o] = bfloat(g * b * s * (1.0f + a * (1.0f - s)));
       dA3[o] = bfloat(g * si);
+    }
+  }
+}
+
+// moe_bwd_h with the pre-activations kept from the forward: dH = dY W2 is
+// the only matmul. dA1 and dA3 are written over A1 and A3, which nothing
+// reads again.
+kernel void moe_bwd_h_saved(device const bfloat* dY [[buffer(0)]],   // [M, D]
+                            device const bfloat* W2T [[buffer(1)]],  // [E, F, D]
+                            device bfloat* A1 [[buffer(2)]],         // in: A1, out: dA1
+                            device bfloat* A3 [[buffer(3)]],         // in: A3, out: dA3
+                            device bfloat* H [[buffer(4)]],          // [M, F]
+                            device const int4* tiles [[buffer(5)]],
+                            constant int& D [[buffer(6)]], constant int& F [[buffer(7)]],
+                            uint2 tg [[threadgroup_position_in_grid]]) {
+  const int4 t = tiles[tg.y];
+  const int e = t.x, r0 = t.y, r1 = t.z, f0 = int(tg.x) * TN;
+  auto Gb = mat(dY, D, r1).slice(0, r0);
+  auto W2Tb = mat(W2T + size_t(e) * F * D, D, F).slice(0, f0);
+  NT op;
+  auto G = op.get_destination_cooperative_tensor<decltype(Gb), decltype(W2Tb), float>();
+  op.run(Gb, W2Tb, G);
+  for (ushort i = 0; i < G.get_capacity(); ++i) {
+    if (!G.is_valid_element(i)) continue;
+    auto ix = G.get_multidimensional_index(i);
+    const int r = r0 + ix[1];
+    if (r < r1) {
+      const size_t o = size_t(r) * F + f0 + ix[0];
+      const float a = float(A1[o]), b = float(A3[o]), g = G[i];
+      const float s = sigm(a), si = a * s;
+      H[o] = bfloat(si * b);
+      A1[o] = bfloat(g * b * s * (1.0f + a * (1.0f - s)));
+      A3[o] = bfloat(g * si);
     }
   }
 }
@@ -297,6 +365,46 @@ def weights_bf16(pool):
     return w1, w3, w2, _W2T["t"]
 
 
+# KEEPING THE FORWARD'S PRE-ACTIVATIONS. The backward needs A1 = X W1^T and
+# A3 = X W3^T. Recomputing them is two of its three matmuls; keeping them is
+# 2 x [assignments, d_ff] in bf16 a row - ~0.2 GB at a 4,096 window, and a
+# learning step can run twenty rows deep. So they are kept while what is
+# kept stays inside a budget, and rows past it recompute: the first rows,
+# which have the most characters still active, are the ones kept. The
+# budget is a share of what the GPU may use - nothing on a small card, where
+# memory is the constraint this model was built around.
+# MINAGI_EXPERT_SAVE_GB sets it outright; 0 turns keeping off.
+
+_KEPT = []                  # weak references to what forwards have kept
+
+
+def _budget(device):
+    env = os.environ.get("MINAGI_EXPERT_SAVE_GB")
+    if env is not None:
+        return float(env) * 2 ** 30
+    from minagi import device as D
+    total = D.total(device) or 0
+    return 0.2 * total if total >= 10 * 2 ** 30 else 0.0
+
+
+def _may_keep(nbytes, device):
+    live = []
+    for r in _KEPT:
+        t = r()
+        if t is not None:
+            live.append(r)
+    _KEPT[:] = live
+    used = sum(r().nbytes for r in live if r() is not None)
+    if used + nbytes > _budget(device):
+        return False
+    return True
+
+
+def _keep(*ts):
+    import weakref
+    _KEPT.extend(weakref.ref(t) for t in ts)
+
+
 class _ExpertSwiGLU(torch.autograd.Function):
 
     @staticmethod
@@ -306,27 +414,50 @@ class _ExpertSwiGLU(torch.autograd.Function):
         X = flat[t_sorted].to(torch.bfloat16).contiguous()
         M, nt = X.shape[0], tiles.shape[0]
         H = torch.empty(M, F, device=flat.device, dtype=torch.bfloat16)
-        _launch("moe_up", (F // TN, nt), X, w1, w3, H, tiles, D, F)
+        # (a Function's forward always runs with grad mode off: whether this
+        # call will be differentiated is what needs_input_grad says)
+        keep = (any(ctx.needs_input_grad[:4])
+                and _may_keep(X.nbytes + 2 * H.nbytes, flat.device))
+        if keep:
+            A1, A3 = torch.empty_like(H), torch.empty_like(H)
+            _launch("moe_up_save", (F // TN, nt), X, w1, w3, H, A1, A3, tiles, D, F)
+            _keep(X, A1, A3)
+        else:
+            _launch("moe_up", (F // TN, nt), X, w1, w3, H, tiles, D, F)
         if flat.dtype == torch.float32:
             Y, k = torch.empty(M, D, device=flat.device), "moe_down_f32"
         else:
             Y, k = torch.empty(M, D, device=flat.device, dtype=torch.bfloat16), "moe_down_bf16"
         _launch(k, (D // TN, nt), H, w2, Y, tiles, D, F)
-        ctx.save_for_backward(flat, t_sorted, tiles, groups)
+        ctx.kept = keep
+        if keep:
+            ctx.save_for_backward(flat, t_sorted, tiles, groups, X, A1, A3)
+        else:
+            ctx.save_for_backward(flat, t_sorted, tiles, groups)
         ctx.wb = wb
         return Y if Y.dtype == flat.dtype else Y.to(flat.dtype)
 
     @staticmethod
     def backward(ctx, dY):
-        flat, t_sorted, tiles, groups = ctx.saved_tensors
         w1, w3, w2, w2t = ctx.wb
         E, F, D = w1.shape
-        dev = flat.device
-        X = flat[t_sorted].to(torch.bfloat16).contiguous()
         dYb = dY.to(torch.bfloat16).contiguous()
-        M, nt = X.shape[0], tiles.shape[0]
-        H, dA1, dA3 = (torch.empty(M, F, device=dev, dtype=torch.bfloat16) for _ in range(3))
-        _launch("moe_bwd_h", (F // TN, nt), X, dYb, w1, w3, w2t, H, dA1, dA3, tiles, D, F)
+        if ctx.kept:
+            flat, t_sorted, tiles, groups, X, dA1, dA3 = ctx.saved_tensors
+            dev, M, nt = flat.device, X.shape[0], tiles.shape[0]
+            H = torch.empty(M, F, device=dev, dtype=torch.bfloat16)
+            _launch("moe_bwd_h_saved", (F // TN, nt), dYb, w2t, dA1, dA3, H, tiles, D, F)
+            # A1 and A3 now hold dA1 and dA3: a second backward through this
+            # graph must fail rather than read them as A1 and A3
+            torch.autograd.graph.increment_version(dA1)
+            torch.autograd.graph.increment_version(dA3)
+        else:
+            flat, t_sorted, tiles, groups = ctx.saved_tensors
+            dev = flat.device
+            X = flat[t_sorted].to(torch.bfloat16).contiguous()
+            M, nt = X.shape[0], tiles.shape[0]
+            H, dA1, dA3 = (torch.empty(M, F, device=dev, dtype=torch.bfloat16) for _ in range(3))
+            _launch("moe_bwd_h", (F // TN, nt), X, dYb, w1, w3, w2t, H, dA1, dA3, tiles, D, F)
         dX = torch.empty(M, D, device=dev)
         _launch("moe_dx", (D // TN, nt), dA1, dA3, w1, w3, dX, tiles, D, F)
         dflat = torch.zeros_like(flat).index_add_(0, t_sorted, dX.to(flat.dtype))
